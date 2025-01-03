@@ -1,0 +1,9 @@
+scapy
+pyshark
+pandas
+numpy
+scikit-learn
+tensorflow
+torch
+streamlit
+dash
