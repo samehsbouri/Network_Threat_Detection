@@ -1,1 +1,1 @@
-source_ip,dest_ip,timestamp,prediction,flow_duration,packets_per_second,bytes_per_second
+timestamp,prediction,flow_duration,packets_per_second,bytes_per_second,destination_port,active_mean,idle_mean,fwd_packets,bwd_packets,avg_packet_size,severity

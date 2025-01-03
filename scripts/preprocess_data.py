@@ -26,14 +26,17 @@ combined_data['Label'] = label_encoder.fit_transform(combined_data['Label'])
 
 # Normalize numerical features
 scaler = StandardScaler()
-numerical_features = combined_data.select_dtypes(include=['float64', 'int64'])
+
+# Select numerical features (exclude the 'Label' column)
+numerical_features = combined_data.select_dtypes(include=['float64', 'int64']).columns
+numerical_features = numerical_features[numerical_features != 'Label']  # Exclude the label column
 
 # Check for extremely large values
 print("Max values in numerical features:")
-print(numerical_features.max())
+print(combined_data[numerical_features].max())
 
 # Normalize the numerical features
-combined_data[numerical_features.columns] = scaler.fit_transform(numerical_features)
+combined_data[numerical_features] = scaler.fit_transform(combined_data[numerical_features])
 
 # Save the preprocessed dataset
 combined_data.to_csv("data/preprocessed_data.csv", index=False)

@@ -3,11 +3,14 @@ import pandas as pd
 import time
 import os
 import psutil
+from scripts.capture_traffic import capture_traffic
 from scripts.analyze_packets import analyze_packets
-import subprocess
 import threading
-import winreg
+import logging
 from streamlit.runtime.scriptrunner import add_script_run_ctx
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_network_interfaces():
     """Get list of available network interfaces"""
@@ -21,127 +24,59 @@ def get_network_interfaces():
             # Skip loopback interface
             if interface != 'lo' and interface != 'Loopback Pseudo-Interface 1':
                 interface_names.append(interface)
-             
+           
         return interface_names
     except Exception as e:
         st.error(f"Error getting network interfaces: {str(e)}")
         return []
 
-def find_wireshark_path():
-    """Find Wireshark installation path from Windows Registry"""
-    try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wireshark")
-        install_path = winreg.QueryValueEx(key, "InstallPath")[0]
-        winreg.CloseKey(key)
-        return install_path
-    except:
-        try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Wireshark")
-            install_path = winreg.QueryValueEx(key, "InstallPath")[0]
-            winreg.CloseKey(key)
-            return install_path
-        except:
-            common_paths = [
-                r"C:\Program Files\Wireshark",
-                r"C:\Program Files (x86)\Wireshark",
-            ]
-            for path in common_paths:
-                if os.path.exists(path):
-                    return path
-    return None
-
 class CaptureManager:
     def __init__(self):
-        self.process = None
         self.is_running = False
-        self.wireshark_path = find_wireshark_path()
-        if self.wireshark_path:
-            self.tshark_path = os.path.join(self.wireshark_path, "tshark.exe")
-        else:
-            self.tshark_path = None
+        self.capture_thread = None
+        self.stop_event = threading.Event()
 
     def start_capture(self, interface, output_file):
-        if not self.tshark_path or not os.path.exists(self.tshark_path):
-            st.error("Could not find tshark.exe. Please verify Wireshark installation.")
+        """Start packet capture"""
+        if self.is_running:
+            st.warning("Capture is already running!")
             return
 
-        # Modified tshark command with more detailed output
-        command = [
-            self.tshark_path,
-            '-i', interface,
-            '-T', 'fields',
-            '-E', 'header=y',
-            '-E', 'separator=,',
-            '-E', 'quote=d',
-            '-e', 'frame.time_epoch',
-            '-e', 'ip.src',
-            '-e', 'ip.dst',
-            '-e', 'ip.proto',
-            '-e', 'frame.len',
-            '-e', 'tcp.srcport',
-            '-e', 'tcp.dstport',
-            '-e', 'udp.srcport',
-            '-e', 'udp.dstport',
-            '-e', 'ip.len',
-            '-f', 'ip'  # Filter for IP packets only
-        ]
-         
-        try:
-            # Create output directory if it doesn't exist
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
-            
-            # Start capture process with pipe
-            st.write(f"Starting capture on interface: {interface}")
-            st.write(f"Debug: Running command: {' '.join(command)}")
-            
-            self.process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,  # Line buffered
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            
-            self.is_running = True
-            
-            # Open output file for writing
-            with open(output_file, 'w', buffering=1) as f:
-                # Write header
-                header = "timestamp,source_ip,dest_ip,protocol,frame_length,src_port,dst_port,udp_src_port,udp_dst_port,ip_length\n"
-                f.write(header)
-                
-                # Process output line by line
-                while self.is_running:
-                    line = self.process.stdout.readline()
-                    if line:
-                        st.write(f"Debug: Captured packet: {line.strip()}")  # Debug output
-                        f.write(line)
-                        f.flush()  # Ensure data is written to disk
-                    
-                    # Check for process termination
-                    if self.process.poll() is not None:
-                        error = self.process.stderr.read()
-                        if error:
-                            st.error(f"Capture error: {error}")
-                        break
-                    
-                    # Small delay to prevent high CPU usage
-                    time.sleep(0.1)
-                    
-        except Exception as e:
-            st.error(f"Capture error: {str(e)}")
-        finally:
-            self.stop_capture()
+        self.is_running = True
+        self.stop_event.clear()
+        
+        def run_capture():
+            try:
+                capture_traffic(interface, output_file, self.stop_event)
+            except Exception as e:
+                logging.error(f"Error in capture thread: {str(e)}")
+            finally:
+                self.is_running = False
+
+        # Create and start capture thread
+        self.capture_thread = threading.Thread(
+            target=run_capture,
+            daemon=True
+        )
+        add_script_run_ctx(self.capture_thread)
+        self.capture_thread.start()
+        logging.info(f"Capture started on interface: {interface}")
+        st.success(f"Capture started on interface: {interface}")
 
     def stop_capture(self):
-        self.is_running = False
-        if self.process:
-            self.process.terminate()
-            self.process.wait()
-            self.process = None
+        """Stop packet capture"""
+        if self.is_running:
+            self.stop_event.set()
+            if self.capture_thread:
+                self.capture_thread.join(timeout=5)
+            self.is_running = False
+            logging.info("Capture stopped!")
+            st.success("Capture stopped!")
+        else:
+            st.warning("No capture is currently running.")
 
 def load_alerts(file_path):
+    """Load alerts from a CSV file"""
     try:
         if os.path.exists(file_path):
             return pd.read_csv(file_path)
@@ -156,13 +91,6 @@ def main():
     # Initialize capture manager
     if 'capture_manager' not in st.session_state:
         st.session_state.capture_manager = CaptureManager()
-    
-    # Display Wireshark information
-    if st.session_state.capture_manager.wireshark_path:
-        st.success(f"Found Wireshark at: {st.session_state.capture_manager.wireshark_path}")
-    else:
-        st.error("Wireshark installation not found! Please install Wireshark first.")
-        st.stop()
     
     # Interface selection
     interfaces = get_network_interfaces()
@@ -184,40 +112,41 @@ def main():
     # Display current capture file size
     if os.path.exists(output_file):
         file_size = os.path.getsize(output_file)
-        st.write(f"Current capture file size: {file_size/1024:.2f} KB")
+        if file_size < 1024 * 1024:  # Less than 1 MB
+            st.write(f"Current capture file size: {file_size/1024:.2f} KB")
+        else:
+            st.write(f"Current capture file size: {file_size/(1024 * 1024):.2f} MB")
     
     # Start/Stop buttons
     col1, col2 = st.columns(2)
     
     with col1:
         if st.button('Start Capture'):
-            if not st.session_state.capture_manager.is_running:
-                capture_thread = threading.Thread(
-                    target=st.session_state.capture_manager.start_capture,
-                    args=(selected_interface, output_file)
-                )
-                add_script_run_ctx(capture_thread)
-                capture_thread.start()
-                st.success("Capture started!")
+            st.session_state.capture_manager.start_capture(selected_interface, output_file)
     
     with col2:
         if st.button('Stop Capture'):
-            if st.session_state.capture_manager.is_running:
-                st.session_state.capture_manager.stop_capture()
-                st.success("Capture stopped!")
+            st.session_state.capture_manager.stop_capture()
     
     # Status indicator
     st.markdown("---")
-    st.write("Status: " + 
-             ("Capturing" if st.session_state.capture_manager.is_running 
-              else "Stopped"))
+    status_placeholder = st.empty()
+    status_placeholder.write("Status: " + 
+        ("📊 Capturing..." if st.session_state.capture_manager.is_running 
+         else "⏹️ Stopped"))
     
     # Analysis section
     if st.button('Analyze Captured Traffic'):
         if os.path.exists(output_file):
             with st.spinner('Analyzing traffic...'):
-                analyze_packets(output_file, model_file, alerts_file)
-            st.success('Analysis complete!')
+                try:
+                    success = analyze_packets(output_file, model_file, alerts_file)
+                    if success:
+                        st.success('Analysis complete!')
+                    else:
+                        st.error('Analysis failed. Check the logs for details.')
+                except Exception as e:
+                    st.error(f"Error during analysis: {str(e)}")
         else:
             st.warning('No captured traffic data found.')
     
@@ -226,22 +155,40 @@ def main():
     st.subheader("Latest Alerts")
     
     if st.button('Refresh Alerts'):
-        st.rerun()  # Changed from st.experimental_rerun() to st.rerun()
+        st.rerun()
     
     alerts_df = load_alerts(alerts_file)
     if not alerts_df.empty:
-        st.dataframe(alerts_df)
+        # Add color coding based on prediction
+        def color_code(row):
+            return ['background-color: #ff000033' if row['prediction'] == 1 
+                   else 'background-color: #00ff0033' for _ in row]
         
+        styled_df = alerts_df.style.apply(color_code, axis=1)
+        st.dataframe(styled_df)
+        
+        # Display statistics
         st.subheader("Statistics")
         col1, col2 = st.columns(2)
         with col1:
             st.metric("Total Alerts", len(alerts_df))
         with col2:
             if 'prediction' in alerts_df.columns:
-                st.metric("Threat Ratio", 
-                         f"{(alerts_df['prediction'] == 1).mean():.2%}")
+                threat_ratio = (alerts_df['prediction'] == 1).mean()
+                st.metric("Threat Ratio", f"{threat_ratio:.2%}")
+        
+        # Add threat distribution visualization
+        if 'prediction' in alerts_df.columns:
+            st.subheader("Threat Distribution")
+            threat_counts = alerts_df['prediction'].value_counts()
+            st.bar_chart(threat_counts)
     else:
         st.info("No alerts to display")
+
+    # Add auto-refresh functionality
+    if st.session_state.capture_manager.is_running:
+        time.sleep(1)  # Add a small delay
+        st.rerun()
 
 if __name__ == "__main__":
     main()
